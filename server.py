@@ -1,517 +1,408 @@
-"""
-DarkChat Server v2 - threading mode (compatible with Python 3.14)
-"""
-
-from flask import Flask, request, jsonify
-from flask_socketio import SocketIO, emit, join_room, leave_room
-from flask_cors import CORS
-import sqlite3
-import hashlib
-import os
-import random
-import string
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict
+from datetime import datetime, timedelta
+import motor.motor_asyncio
+import bcrypt
 import jwt
-import datetime
-import cloudinary
-import cloudinary.uploader
-import cloudinary.api
-import re
-import logging
-from functools import wraps
+import os
+import socketio
+from dotenv import load_dotenv
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("darkchat")
+# Load environment variables
+load_dotenv()
 
-app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'darkchat_super_secret_2024')
-CORS(app, resources={r"/*": {"origins": "*"}})
+# FastAPI App
+app = FastAPI()
 
-socketio = SocketIO(
-    app,
-    cors_allowed_origins="*",
-    async_mode='threading',
-    ping_timeout=60,
-    ping_interval=25,
-    logger=False,
-    engineio_logger=False
+# Socket.IO Server
+sio = socketio.AsyncServer(async_mode=\
+'asgi', cors_allowed_origins="*")
+app.mount('/socket.io', socketio.ASGIApp(sio))
+
+# CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
 )
 
-cloudinary.config(
-    cloud_name=os.environ.get('CLOUDINARY_CLOUD', 'dqg579k9q'),
-    api_key=os.environ.get('CLOUDINARY_KEY', '10765149794639631'),
-    api_secret=os.environ.get('CLOUDINARY_SECRET', ''),
-    secure=True
-)
+# MongoDB Connection
+MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/darkchat")
+client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI)
+db = client.darkchat
 
-DB_PATH = os.environ.get('DB_PATH', 'darkchat.db')
-online_users = {}
+# JWT Secret
+JWT_SECRET = os.getenv("JWT_SECRET", "supersecretjwtkey")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 
-def init_db():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            username   TEXT    NOT NULL,
-            email      TEXT    NOT NULL UNIQUE,
-            password   TEXT    NOT NULL,
-            dc_id      TEXT    NOT NULL DEFAULT '',
-            avatar_url TEXT    NOT NULL DEFAULT '',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    for col, definition in [
-        ('dc_id',      "TEXT NOT NULL DEFAULT ''"),
-        ('avatar_url', "TEXT NOT NULL DEFAULT ''"),
-    ]:
-        try:
-            c.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
-            conn.commit()
-        except Exception:
-            pass
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS conversations (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            user1_id   INTEGER NOT NULL,
-            user2_id   INTEGER NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user1_id, user2_id),
-            FOREIGN KEY(user1_id) REFERENCES users(id),
-            FOREIGN KEY(user2_id) REFERENCES users(id)
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS messages (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id INTEGER NOT NULL,
-            sender_id       INTEGER NOT NULL,
-            content         TEXT    NOT NULL,
-            is_starred      INTEGER DEFAULT 0,
-            read_at         DATETIME,
-            created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(conversation_id) REFERENCES conversations(id),
-            FOREIGN KEY(sender_id)       REFERENCES users(id)
-        )
-    ''')
-    conn.commit()
-    conn.close()
-    log.info("✅ Database ready")
+# Models
+class UserInDB(BaseModel):
+    id: Optional[str] = Field(alias="_id")
+    username: str
+    email: str
+    hashed_password: str
 
-def hash_password(p): return hashlib.sha256(p.encode()).hexdigest()
-def safe_str(v): return v if v else ''
-
-def generate_dc_id():
-    chars = string.ascii_uppercase + string.digits
-    for _ in range(20):
-        dc_id = "DC-" + ''.join(random.choices(chars, k=6))
-        conn = get_db()
-        try:
-            row = conn.execute("SELECT id FROM users WHERE dc_id=?", (dc_id,)).fetchone()
-            if not row:
-                return dc_id
-        finally:
-            conn.close()
-    raise RuntimeError("dc_id generation failed")
-
-def generate_token(user_id):
-    payload = {'user_id': user_id,
-               'exp': datetime.datetime.utcnow() + datetime.timedelta(days=30)}
-    return jwt.encode(payload, app.config['SECRET_KEY'], algorithm='HS256')
-
-def decode_token(token):
-    try:
-        return jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-    except Exception:
-        return None
-
-def token_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        token = request.headers.get('Authorization', '').replace('Bearer ', '').strip()
-        if not token:
-            return jsonify({'error': 'Token required'}), 401
-        data = decode_token(token)
-        if not data:
-            return jsonify({'error': 'Invalid or expired token'}), 401
-        return f(data['user_id'], *args, **kwargs)
-    return decorated
-
-def user_dict(u):
-    return {'id': u['id'], 'username': safe_str(u['username']),
-            'email': safe_str(u['email']), 'dc_id': safe_str(u['dc_id']),
-            'avatar_url': safe_str(u['avatar_url'])}
-
-def get_conv_room(cid): return f"conv_{cid}"
-def get_user_room(uid): return f"user_{uid}"
-
-# ── Auth ──────────────────────────────────────
-@app.route('/api/register', methods=['POST'])
-def register():
-    try:
-        data     = request.get_json(force=True, silent=True) or {}
-        username = data.get('username', '').strip()
-        email    = data.get('email', '').strip().lower()
-        password = data.get('password', '')
-        if not username or not email or not password:
-            return jsonify({'error': 'جميع الحقول مطلوبة'}), 400
-        if len(password) < 6:
-            return jsonify({'error': 'كلمة المرور 6 أحرف على الأقل'}), 400
-        if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
-            return jsonify({'error': 'البريد الإلكتروني غير صحيح'}), 400
-        dc_id   = generate_dc_id()
-        pw_hash = hash_password(password)
-        conn = get_db()
-        try:
-            conn.execute("INSERT INTO users (username,email,password,dc_id) VALUES (?,?,?,?)",
-                         (username, email, pw_hash, dc_id))
-            conn.commit()
-            user = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-            token = generate_token(user['id'])
-            return jsonify({'token': token, 'user': user_dict(user)}), 201
-        except sqlite3.IntegrityError:
-            return jsonify({'error': 'البريد الإلكتروني مستخدم مسبقاً'}), 409
-        finally:
-            conn.close()
-    except Exception as e:
-        log.error(f"register: {e}")
-        return jsonify({'error': 'خطأ في السيرفر'}), 500
-
-@app.route('/api/login', methods=['POST'])
-def login():
-    try:
-        data     = request.get_json(force=True, silent=True) or {}
-        email    = data.get('email', '').strip().lower()
-        password = data.get('password', '')
-        if not email or not password:
-            return jsonify({'error': 'البريد وكلمة المرور مطلوبان'}), 400
-        conn = get_db()
-        try:
-            user = conn.execute("SELECT * FROM users WHERE email=? AND password=?",
-                                (email, hash_password(password))).fetchone()
-        finally:
-            conn.close()
-        if not user:
-            return jsonify({'error': 'البريد أو كلمة المرور غلط'}), 401
-        return jsonify({'token': generate_token(user['id']), 'user': user_dict(user)})
-    except Exception as e:
-        log.error(f"login: {e}")
-        return jsonify({'error': 'خطأ في السيرفر'}), 500
-
-@app.route('/api/me', methods=['GET'])
-@token_required
-def get_me(user_id):
-    conn = get_db()
-    try:
-        user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-    finally:
-        conn.close()
-    if not user:
-        return jsonify({'error': 'المستخدم غير موجود'}), 404
-    return jsonify(user_dict(user))
-
-# ── Users ─────────────────────────────────────
-@app.route('/api/users/search', methods=['GET'])
-@token_required
-def search_users(user_id):
-    q = request.args.get('q', '').strip()
-    if not q or len(q) < 2:
-        return jsonify([])
-    conn = get_db()
-    try:
-        users = conn.execute(
-            "SELECT id,username,dc_id,avatar_url FROM users WHERE (dc_id LIKE ? OR username LIKE ?) AND id!=? LIMIT 20",
-            (f'%{q}%', f'%{q}%', user_id)).fetchall()
-    finally:
-        conn.close()
-    return jsonify([{'id':u['id'],'username':safe_str(u['username']),
-                     'dc_id':safe_str(u['dc_id']),'avatar_url':safe_str(u['avatar_url'])} for u in users])
-
-@app.route('/api/users/<int:uid>', methods=['GET'])
-@token_required
-def get_user(current_user_id, uid):
-    conn = get_db()
-    try:
-        user = conn.execute("SELECT id,username,dc_id,avatar_url FROM users WHERE id=?", (uid,)).fetchone()
-    finally:
-        conn.close()
-    if not user:
-        return jsonify({'error': 'المستخدم غير موجود'}), 404
-    return jsonify({'id':user['id'],'username':safe_str(user['username']),
-                    'dc_id':safe_str(user['dc_id']),'avatar_url':safe_str(user['avatar_url']),
-                    'is_online': uid in online_users})
-
-@app.route('/api/users/update', methods=['PUT'])
-@token_required
-def update_user(user_id):
-    data = request.get_json(force=True, silent=True) or {}
-    username = data.get('username', '').strip()
-    if not username:
-        return jsonify({'error': 'الاسم مطلوب'}), 400
-    conn = get_db()
-    try:
-        conn.execute("UPDATE users SET username=? WHERE id=?", (username, user_id))
-        conn.commit()
-        user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-    finally:
-        conn.close()
-    return jsonify(user_dict(user))
-
-@app.route('/api/users/avatar', methods=['POST'])
-@token_required
-def upload_avatar(user_id):
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-        img  = data.get('image_base64', '')
-        if not img:
-            return jsonify({'error': 'لا توجد صورة'}), 400
-        if ',' in img:
-            img = img.split(',')[1]
-        result = cloudinary.uploader.upload(
-            f"data:image/jpeg;base64,{img}",
-            folder="darkchat_avatars", public_id=f"user_{user_id}",
-            overwrite=True, resource_type="image",
-            transformation=[{'width':300,'height':300,'crop':'fill','gravity':'face'}])
-        url = result['secure_url']
-        conn = get_db()
-        try:
-            conn.execute("UPDATE users SET avatar_url=? WHERE id=?", (url, user_id))
-            conn.commit()
-        finally:
-            conn.close()
-        return jsonify({'avatar_url': url})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-# ── Conversations ─────────────────────────────
-@app.route('/api/conversations', methods=['GET'])
-@token_required
-def get_conversations(user_id):
-    try:
-        conn = get_db()
-        try:
-            rows = conn.execute("""
-                SELECT c.id,c.user1_id,c.user2_id,c.created_at,
-                       m.content AS last_message, m.created_at AS last_message_at,
-                       m.sender_id AS last_sender_id,
-                       u.username AS other_username, u.dc_id AS other_dc_id,
-                       u.avatar_url AS other_avatar, u.id AS other_id,
-                       (SELECT COUNT(*) FROM messages WHERE conversation_id=c.id
-                        AND sender_id!=? AND read_at IS NULL) AS unread_count
-                FROM conversations c
-                JOIN users u ON u.id=CASE WHEN c.user1_id=? THEN c.user2_id ELSE c.user1_id END
-                LEFT JOIN messages m ON m.id=(
-                    SELECT id FROM messages WHERE conversation_id=c.id
-                    ORDER BY created_at DESC LIMIT 1)
-                WHERE c.user1_id=? OR c.user2_id=?
-                ORDER BY COALESCE(m.created_at,c.created_at) DESC
-            """, (user_id,user_id,user_id,user_id)).fetchall()
-        finally:
-            conn.close()
-        return jsonify([{
-            'id': r['id'],
-            'other_user': {'id':r['other_id'],'username':safe_str(r['other_username']),
-                           'dc_id':safe_str(r['other_dc_id']),'avatar_url':safe_str(r['other_avatar']),
-                           'is_online': r['other_id'] in online_users},
-            'last_message': r['last_message'], 'last_message_at': r['last_message_at'],
-            'last_sender_id': r['last_sender_id'], 'unread_count': r['unread_count'] or 0,
-            'created_at': r['created_at']
-        } for r in rows])
-    except Exception as e:
-        log.error(f"get_conversations: {e}")
-        return jsonify({'error': 'خطأ في السيرفر'}), 500
-
-@app.route('/api/conversations', methods=['POST'])
-@token_required
-def create_conversation(user_id):
-    try:
-        data     = request.get_json(force=True, silent=True) or {}
-        other_id = data.get('other_user_id')
-        if not other_id:
-            return jsonify({'error': 'other_user_id مطلوب'}), 400
-        other_id = int(other_id)
-        if other_id == user_id:
-            return jsonify({'error': 'لا تستطيع محادثة نفسك'}), 400
-        u1,u2 = min(user_id,other_id), max(user_id,other_id)
-        conn = get_db()
-        try:
-            conn.execute("INSERT OR IGNORE INTO conversations (user1_id,user2_id) VALUES (?,?)", (u1,u2))
-            conn.commit()
-            conv = conn.execute("SELECT id FROM conversations WHERE user1_id=? AND user2_id=?", (u1,u2)).fetchone()
-        finally:
-            conn.close()
-        return jsonify({'conversation_id': conv['id']}), 201
-    except Exception as e:
-        log.error(f"create_conversation: {e}")
-        return jsonify({'error': 'خطأ في السيرفر'}), 500
-
-# ── Messages ──────────────────────────────────
-@app.route('/api/conversations/<int:conv_id>/messages', methods=['GET'])
-@token_required
-def get_messages(user_id, conv_id):
-    try:
-        conn = get_db()
-        try:
-            conv = conn.execute(
-                "SELECT * FROM conversations WHERE id=? AND (user1_id=? OR user2_id=?)",
-                (conv_id,user_id,user_id)).fetchone()
-            if not conv:
-                return jsonify({'error': 'غير مصرح'}), 403
-            conn.execute(
-                "UPDATE messages SET read_at=CURRENT_TIMESTAMP WHERE conversation_id=? AND sender_id!=? AND read_at IS NULL",
-                (conv_id,user_id))
-            conn.commit()
-            offset = max(0, int(request.args.get('offset',0)))
-            limit  = min(100, max(1, int(request.args.get('limit',50))))
-            msgs = conn.execute("""
-                SELECT m.id,m.conversation_id,m.sender_id,m.content,m.is_starred,m.read_at,m.created_at,
-                       u.username AS sender_name, u.avatar_url AS sender_avatar
-                FROM messages m JOIN users u ON u.id=m.sender_id
-                WHERE m.conversation_id=? ORDER BY m.created_at DESC LIMIT ? OFFSET ?
-            """, (conv_id,limit,offset)).fetchall()
-        finally:
-            conn.close()
-        return jsonify([{
-            'id':m['id'],'conversation_id':m['conversation_id'],'sender_id':m['sender_id'],
-            'sender_name':safe_str(m['sender_name']),'sender_avatar':safe_str(m['sender_avatar']),
-            'content':m['content'],'is_starred':bool(m['is_starred']),
-            'read_at':m['read_at'],'created_at':m['created_at']
-        } for m in reversed(msgs)])
-    except Exception as e:
-        log.error(f"get_messages: {e}")
-        return jsonify({'error': 'خطأ في السيرفر'}), 500
-
-@app.route('/api/conversations/<int:conv_id>/messages', methods=['POST'])
-@token_required
-def send_message(user_id, conv_id):
-    try:
-        data    = request.get_json(force=True, silent=True) or {}
-        content = data.get('content', '').strip()
-        if not content:
-            return jsonify({'error': 'الرسالة فارغة'}), 400
-        conn = get_db()
-        try:
-            conv = conn.execute(
-                "SELECT * FROM conversations WHERE id=? AND (user1_id=? OR user2_id=?)",
-                (conv_id,user_id,user_id)).fetchone()
-            if not conv:
-                return jsonify({'error': 'غير مصرح'}), 403
-            cur = conn.execute(
-                "INSERT INTO messages (conversation_id,sender_id,content) VALUES (?,?,?)",
-                (conv_id,user_id,content))
-            conn.commit()
-            msg = conn.execute("""
-                SELECT m.*,u.username AS sender_name,u.avatar_url AS sender_avatar
-                FROM messages m JOIN users u ON u.id=m.sender_id WHERE m.id=?
-            """, (cur.lastrowid,)).fetchone()
-        finally:
-            conn.close()
-        msg_data = {
-            'id':msg['id'],'conversation_id':conv_id,'sender_id':user_id,
-            'sender_name':safe_str(msg['sender_name']),'sender_avatar':safe_str(msg['sender_avatar']),
-            'content':content,'is_starred':False,'read_at':None,'created_at':msg['created_at']
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {
+            datetime: lambda dt: dt.isoformat(),
+            str: lambda v: str(v) if isinstance(v, motor.core.ObjectId) else v
         }
-        socketio.emit('new_message', msg_data, room=get_conv_room(conv_id))
-        other_id = conv['user2_id'] if conv['user1_id']==user_id else conv['user1_id']
-        socketio.emit('message_notification',{'conversation_id':conv_id,'message':msg_data},
-                      room=get_user_room(other_id))
-        return jsonify(msg_data), 201
-    except Exception as e:
-        log.error(f"send_message: {e}")
-        return jsonify({'error': 'خطأ في السيرفر'}), 500
 
-@app.route('/api/messages/<int:msg_id>/star', methods=['PUT'])
-@token_required
-def toggle_star(user_id, msg_id):
-    conn = get_db()
+class UserCreate(BaseModel):
+    username: str
+    email: str
+    password: str
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+class UserPublic(BaseModel):
+    id: str = Field(alias="_id")
+    username: str
+    email: str
+
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {
+            str: lambda v: str(v) if isinstance(v, motor.core.ObjectId) else v
+        }
+
+class Message(BaseModel):
+    id: Optional[str] = Field(alias="_id")
+    conversationId: str
+    sender: str  # User ID
+    content: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    isEdited: bool = False
+    isDeleted: bool = False
+
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {
+            datetime: lambda dt: dt.isoformat(),
+            str: lambda v: str(v) if isinstance(v, motor.core.ObjectId) else v
+        }
+
+class Conversation(BaseModel):
+    id: Optional[str] = Field(alias="_id")
+    participants: List[str]  # List of User IDs
+    lastMessage: Optional[str] = None  # Message ID
+    updatedAt: datetime = Field(default_factory=datetime.utcnow)
+
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {
+            datetime: lambda dt: dt.isoformat(),
+            str: lambda v: str(v) if isinstance(v, motor.core.ObjectId) else v
+        }
+
+# Utility functions
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> UserPublic:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
     try:
-        msg = conn.execute("SELECT * FROM messages WHERE id=?", (msg_id,)).fetchone()
-        if not msg:
-            return jsonify({'error': 'الرسالة غير موجودة'}), 404
-        new_star = 0 if msg['is_starred'] else 1
-        conn.execute("UPDATE messages SET is_starred=? WHERE id=?", (new_star,msg_id))
-        conn.commit()
-    finally:
-        conn.close()
-    return jsonify({'is_starred': bool(new_star)})
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+        user_id: str = payload.get("userId")
+        if user_id is None:
+            raise credentials_exception
+        user = await db.users.find_one({"_id": user_id})
+        if user is None:
+            raise credentials_exception
+        return UserPublic(**user)
+    except jwt.PyJWTError:
+        raise credentials_exception
 
-# ── Health ────────────────────────────────────
-@app.route('/', methods=['GET'])
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({'status':'ok','app':'DarkChat','version':'2.0.0'})
+# Routes
+@app.get("/")
+async def read_root():
+    return {"message": "Dark Chat Server (Python) is running!"}
 
-# ── Socket.IO ─────────────────────────────────
-@socketio.on('connect')
-def on_connect():
-    log.info(f"[WS] connect: {request.sid}")
+@app.post("/api/register", response_model=UserPublic)
+async def register_user(user_data: UserCreate):
+    existing_user = await db.users.find_one({"$or": [{
+        "username": user_data.username
+    }, {
+        "email": user_data.email
+    }]})
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Username or Email already exists")
 
-@socketio.on('disconnect')
-def on_disconnect():
-    uid_found = None
-    for uid,sid in list(online_users.items()):
-        if sid == request.sid:
-            uid_found = uid
-            break
-    if uid_found is not None:
-        del online_users[uid_found]
-        emit('user_offline', {'user_id': uid_found}, broadcast=True)
+    hashed_password = hash_password(user_data.password)
+    user_dict = user_data.dict()
+    user_dict["hashed_password"] = hashed_password
+    del user_dict["password"]
 
-@socketio.on('authenticate')
-def on_authenticate(data):
-    info = decode_token((data or {}).get('token',''))
-    if not info:
-        emit('auth_error', {'message': 'Invalid token'})
-        return
-    uid = info['user_id']
-    online_users[uid] = request.sid
-    join_room(get_user_room(uid))
-    emit('authenticated', {'user_id': uid})
-    emit('user_online', {'user_id': uid}, broadcast=True)
+    result = await db.users.insert_one(user_dict)
+    new_user = await db.users.find_one({"_id": result.inserted_id})
+    return UserPublic(**new_user)
 
-@socketio.on('join_conversation')
-def on_join_conversation(data):
-    cid = (data or {}).get('conversation_id')
-    if cid: join_room(get_conv_room(cid))
+@app.post("/api/login")
+async def login_for_access_token(form_data: UserLogin):
+    user = await db.users.find_one({"email": form_data.email})
+    if not user or not verify_password(form_data.password, user["hashed_password"]):
+        raise HTTPException(status_code=400, detail="Incorrect email or password")
 
-@socketio.on('leave_conversation')
-def on_leave_conversation(data):
-    cid = (data or {}).get('conversation_id')
-    if cid: leave_room(get_conv_room(cid))
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={
+            "userId": str(user["_id"]),
+            "username": user["username"],
+            "email": user["email"]
+        },
+        expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer", "username": user["username"], "email": user["email"], "userId": str(user["_id"])}
 
-@socketio.on('typing')
-def on_typing(data):
-    data = data or {}
-    cid = data.get('conversation_id')
-    if cid:
-        emit('typing_status',{'user_id':data.get('user_id'),'conversation_id':cid,
-             'is_typing':data.get('is_typing',False)},
-             room=get_conv_room(cid), include_self=False)
+@app.get("/api/profile", response_model=UserPublic)
+async def get_profile(current_user: UserPublic = Depends(get_current_user)):
+    return current_user
 
-@socketio.on('mark_read')
-def on_mark_read(data):
-    data = data or {}
-    cid,uid = data.get('conversation_id'), data.get('user_id')
-    if cid and uid:
-        conn = get_db()
-        try:
-            conn.execute("UPDATE messages SET read_at=CURRENT_TIMESTAMP WHERE conversation_id=? AND sender_id!=? AND read_at IS NULL",(cid,uid))
-            conn.commit()
-        finally:
-            conn.close()
-        emit('messages_read',{'conversation_id':cid,'user_id':uid},
-             room=get_conv_room(cid), include_self=False)
+@app.get("/api/users/search", response_model=List[UserPublic])
+async def search_users(q: str, current_user: UserPublic = Depends(get_current_user)):
+    if not q:
+        raise HTTPException(status_code=400, detail="Search query is required")
+    
+    users_cursor = db.users.find({
+        "$or": [
+            {"username": {"$regex": q, "$options": "i"}},
+            {"email": {"$regex": q, "$options": "i"}}
+        ],
+        "_id": {"$ne": current_user.id} # Exclude current user from search results
+    }).project({"username": 1, "email": 1})
+    
+    users = []
+    async for user in users_cursor:
+        users.append(UserPublic(**user))
+    return users
 
-# ── Init & Run ────────────────────────────────
-init_db()
+@app.post("/api/conversations")
+async def create_conversation(otherUserId: str, current_user: UserPublic = Depends(get_current_user)):
+    userId = current_user.id
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    log.info(f"🚀 DarkChat running on port {port}")
-    socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
+    existing_conversation = await db.conversations.find_one({
+        "participants": {"$all": [userId, otherUserId]}
+    })
+
+    if existing_conversation:
+        return {"conversationId": str(existing_conversation["_id"])}
+
+    conversation_dict = {"participants": [userId, otherUserId]}
+    result = await db.conversations.insert_one(conversation_dict)
+    return {"conversationId": str(result.inserted_id)}
+
+@app.get("/api/conversations", response_model=List[Conversation])
+async def get_conversations(current_user: UserPublic = Depends(get_current_user)):
+    userId = current_user.id
+    conversations_cursor = db.conversations.find({"participants": userId}).sort("updatedAt", -1)
+    
+    conversations = []
+    async for conv in conversations_cursor:
+        other_user_id = next((p for p in conv["participants"] if p != userId), None)
+        other_user = await db.users.find_one({"_id": other_user_id})
+        
+        last_message = None
+        if conv.get("lastMessage"):
+            last_message_doc = await db.messages.find_one({"_id": conv["lastMessage"]})
+            if last_message_doc:
+                last_message = Message(**last_message_doc)
+
+        conversations.append(Conversation(
+            id=str(conv["_id"]),
+            otherUser=UserPublic(**other_user),
+            lastMessage=last_message.id if last_message else None,
+            updatedAt=conv["updatedAt"]
+        ))
+    return conversations
+
+@app.get("/api/conversations/{convId}/messages", response_model=List[Message])
+async def get_messages(convId: str, offset: int = 0, limit: int = 50, current_user: UserPublic = Depends(get_current_user)):
+    messages_cursor = db.messages.find({"conversationId": convId, "isDeleted": False}).sort("timestamp", 1).skip(offset).limit(limit)
+    messages = []
+    async for msg in messages_cursor:
+        messages.append(Message(**msg))
+    return messages
+
+@app.post("/api/conversations/{convId}/messages", response_model=Message)
+async def send_message(convId: str, message_data: Dict[str, str], current_user: UserPublic = Depends(get_current_user)):
+    senderId = current_user.id
+    content = message_data.get("content")
+
+    new_message_dict = {
+        "conversationId": convId,
+        "sender": senderId,
+        "content": content,
+        "timestamp": datetime.utcnow()
+    }
+    result = await db.messages.insert_one(new_message_dict)
+    new_message = await db.messages.find_one({"_id": result.inserted_id})
+
+    await db.conversations.update_one(
+        {"_id": convId},
+        {"$set": {"lastMessage": str(new_message["_id"]), "updatedAt": datetime.utcnow()}}
+    )
+
+    # Emit message via Socket.IO
+    await sio.emit(
+        "new_message",
+        {
+            "id": str(new_message["_id"]),
+            "conversationId": str(new_message["conversationId"]),
+            "senderId": str(new_message["sender"]),
+            "senderName": current_user.username,
+            "content": new_message["content"],
+            "timestamp": new_message["timestamp"].isoformat(),
+            "isEdited": new_message["isEdited"],
+            "isDeleted": new_message["isDeleted"],
+        },
+        room=convId
+    )
+
+    return Message(**new_message)
+
+@app.put("/api/messages/{msgId}", response_model=Message)
+async def edit_message(msgId: str, message_data: Dict[str, str], current_user: UserPublic = Depends(get_current_user)):
+    userId = current_user.id
+    new_content = message_data.get("content")
+
+    message = await db.messages.find_one({"_id": msgId, "sender": userId})
+    if not message:
+        raise HTTPException(status_code=404, detail="Message not found or not authorized")
+
+    await db.messages.update_one(
+        {"_id": msgId},
+        {"$set": {"content": new_content, "isEdited": True, "timestamp": datetime.utcnow()}}
+    )
+    updated_message = await db.messages.find_one({"_id": msgId})
+
+    await sio.emit(
+        "message_edited",
+        {
+            "id": str(updated_message["_id"]),
+            "conversationId": str(updated_message["conversationId"]),
+            "content": updated_message["content"],
+            "isEdited": updated_message["isEdited"],
+        },
+        room=str(updated_message["conversationId"])
+    )
+
+    return Message(**updated_message)
+
+@app.delete("/api/messages/{msgId}")
+async def delete_message(msgId: str, current_user: UserPublic = Depends(get_current_user)):
+    userId = current_user.id
+
+    message = await db.messages.find_one({"_id": msgId})
+    if not message:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    conversation = await db.conversations.find_one({"_id": message["conversationId"]})
+    if not conversation or (str(message["sender"]) != userId and userId not in conversation["participants"]):
+        raise HTTPException(status_code=403, detail="Not authorized to delete this message")
+
+    await db.messages.update_one(
+        {"_id": msgId},
+        {"$set": {"isDeleted": True, "content": "This message was deleted.", "timestamp": datetime.utcnow()}}
+    )
+    deleted_message = await db.messages.find_one({"_id": msgId})
+
+    await sio.emit(
+        "message_deleted",
+        {
+            "id": str(deleted_message["_id"]),
+            "conversationId": str(deleted_message["conversationId"]),
+            "isDeleted": deleted_message["isDeleted"],
+        },
+        room=str(deleted_message["conversationId"])
+    )
+
+    return {"message": "Message deleted successfully", "id": str(deleted_message["_id"]), "isDeleted": deleted_message["isDeleted"]}
+
+# Socket.IO Events
+@sio.event
+async def connect(sid, environ, auth):
+    print("Socket connected:", sid)
+    token = auth.get("token")
+    if not token:
+        raise ConnectionRefusedError("Authentication token missing")
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+        user_id = payload.get("userId")
+        if user_id is None:
+            raise ConnectionRefusedError("Invalid authentication token")
+        sio.enter_room(sid, user_id) # User's personal room
+        sio.sid_to_user_id[sid] = user_id # Store user_id for later use
+        print(f"User {user_id} authenticated with socket {sid}")
+        await sio.emit("user_online", {"userId": user_id}, skip_sid=sid) # Notify others
+    except jwt.PyJWTError:
+        raise ConnectionRefusedError("Invalid authentication token")
+
+@sio.event
+async def disconnect(sid):
+    print("Socket disconnected:", sid)
+    user_id = sio.sid_to_user_id.get(sid)
+    if user_id:
+        await sio.emit("user_offline", {"userId": user_id}, skip_sid=sid) # Notify others
+        del sio.sid_to_user_id[sid]
+
+@sio.event
+async def join_conversation(sid, data):
+    conversation_id = data.get("conversation_id")
+    if conversation_id:
+        sio.enter_room(sid, conversation_id)
+        print(f"User {sio.sid_to_user_id.get(sid)} joined conversation: {conversation_id}")
+
+@sio.event
+async def leave_conversation(sid, data):
+    conversation_id = data.get("conversation_id")
+    if conversation_id:
+        sio.leave_room(sid, conversation_id)
+        print(f"User {sio.sid_to_user_id.get(sid)} left conversation: {conversation_id}")
+
+@sio.event
+async def typing(sid, data):
+    conversation_id = data.get("conversation_id")
+    is_typing = data.get("is_typing")
+    user_id = sio.sid_to_user_id.get(sid)
+    if conversation_id and user_id:
+        await sio.emit("typing_status", {"conversationId": conversation_id, "userId": user_id, "isTyping": is_typing}, room=conversation_id, skip_sid=sid)
+
+# Store mapping from sid to user_id for socket events
+sio.sid_to_user_id = {}
+
+# Run the app with uvicorn (for local development)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
