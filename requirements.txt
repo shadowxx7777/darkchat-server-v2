@@ -4,7 +4,7 @@ python-socketio
 motor
 dnspython
 pydantic
-passlib[bcrypt]
+bcrypt
+PyJWT
 python-multipart
-python-jose[cryptography]
 python-dotenv
