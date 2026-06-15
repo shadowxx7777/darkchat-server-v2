@@ -1,26 +1,45 @@
-from fastapi import FastAPI, HTTPException, Depends, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer
-from pydantic import BaseModel, Field
-from typing import List, Optional, Dict
-from datetime import datetime, timedelta
-import motor.motor_asyncio
-import bcrypt
-import jwt
+
 import os
+import asyncio
+import secrets
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any
+
+from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks
+from fastapi.security import OAuth2PasswordBearer
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from motor.motor_asyncio import AsyncIOMotorClient
+from bson import ObjectId
+from passlib.context import CryptContext
+import jwt
+from jwt.exceptions import InvalidTokenError
 import socketio
 from dotenv import load_dotenv
+import smtplib
+from email.mime.text import MIMEText
 
-# Load environment variables
+# Load environment variables from .env file
 load_dotenv()
 
-# FastAPI App
-app = FastAPI()
+# --- Configuration --- #
+SMTP_SERVER = os.getenv("SMTP_SERVER")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+EMAIL_FROM = os.getenv("EMAIL_FROM")
+VERIFICATION_TOKEN_EXPIRE_MINUTES = 60
+MONGO_DETAILS = os.getenv("MONGODB_URI")
+JWT_SECRET_KEY = os.getenv("JWT_SECRET")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-# Socket.IO Server
-sio = socketio.AsyncServer(async_mode=\
-'asgi', cors_allowed_origins="*")
-app.mount('/socket.io', socketio.ASGIApp(sio))
+# --- FastAPI App Setup --- #
+app = FastAPI(
+    title="Dark Chat Server (Python)",
+    description="Real-time chat application backend with FastAPI, MongoDB, and Socket.IO",
+    version="1.0.0",
+)
 
 # CORS Middleware
 app.add_middleware(
@@ -31,378 +50,597 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-# MongoDB Connection
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/darkchat")
-client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI)
-db = client.darkchat
+# Socket.IO Setup
+sio = socketio.AsyncServer(cors_allowed_origins="*", async_mode="asgi")
+app.mount("/ws", socketio.ASGIApp(sio))
 
-# JWT Secret
-JWT_SECRET = os.getenv("JWT_SECRET", "supersecretjwtkey")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+# --- Database Setup --- #
+class PyObjectId(ObjectId):
+    @classmethod
+    def __get_validators__(cls):
+        yield cls.validate
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
+    @classmethod
+    def validate(cls, v):
+        if not ObjectId.is_valid(v):
+            raise ValueError("Invalid ObjectId")
+        return ObjectId(v)
 
-# Models
-class UserInDB(BaseModel):
-    id: Optional[str] = Field(alias="_id")
-    username: str
-    email: str
-    hashed_password: str
+    @classmethod
+    def __modify_schema__(cls, field_schema: Dict[str, Any]):
+        field_schema.update(type="string")
 
-    class Config:
-        allow_population_by_field_name = True
-        arbitrary_types_allowed = True
-        json_encoders = {
-            datetime: lambda dt: dt.isoformat(),
-            str: lambda v: str(v) if isinstance(v, motor.core.ObjectId) else v
-        }
-
-class UserCreate(BaseModel):
-    username: str
-    email: str
-    password: str
-
-class UserLogin(BaseModel):
-    email: str
-    password: str
-
-class UserPublic(BaseModel):
-    id: str = Field(alias="_id")
-    username: str
-    email: str
+class MongoDBModel(BaseModel):
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
 
     class Config:
         allow_population_by_field_name = True
         arbitrary_types_allowed = True
-        json_encoders = {
-            str: lambda v: str(v) if isinstance(v, motor.core.ObjectId) else v
-        }
+        json_encoders = {ObjectId: str}
 
-class Message(BaseModel):
-    id: Optional[str] = Field(alias="_id")
-    conversationId: str
-    sender: str  # User ID
-    content: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-    isEdited: bool = False
-    isDeleted: bool = False
+client = AsyncIOMotorClient(MONGO_DETAILS)
+database = client.darkchat
+users_collection = database.get_collection("users")
+conversations_collection = database.get_collection("conversations")
+messages_collection = database.get_collection("messages")
+groups_collection = database.get_collection("groups")
 
-    class Config:
-        allow_population_by_field_name = True
-        arbitrary_types_allowed = True
-        json_encoders = {
-            datetime: lambda dt: dt.isoformat(),
-            str: lambda v: str(v) if isinstance(v, motor.core.ObjectId) else v
-        }
+# --- Security --- #
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
 
-class Conversation(BaseModel):
-    id: Optional[str] = Field(alias="_id")
-    participants: List[str]  # List of User IDs
-    lastMessage: Optional[str] = None  # Message ID
-    updatedAt: datetime = Field(default_factory=datetime.utcnow)
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
 
-    class Config:
-        allow_population_by_field_name = True
-        arbitrary_types_allowed = True
-        json_encoders = {
-            datetime: lambda dt: dt.isoformat(),
-            str: lambda v: str(v) if isinstance(v, motor.core.ObjectId) else v
-        }
+def get_password_hash(password):
+    return pwd_context.hash(password)
 
-# Utility functions
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+def create_verification_token(email: str, expires_delta: Optional[timedelta] = None):
+    to_encode = {"sub": email, "type": "email_verification"}
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=VERIFICATION_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+async def send_verification_email(email: str, username: str, token: str):
+    if not all([SMTP_SERVER, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, EMAIL_FROM]):
+        print("SMTP configuration missing. Skipping email verification.")
+        return
+
+    verification_link = f"http://localhost:8000/api/verify-email?token={token}" # TODO: Replace with actual deployed server URL
+    subject = "DarkChat Email Verification"
+    body = f"Hello {username},\n\nThank you for registering with DarkChat. Please click the link below to verify your email address:\n\n{verification_link}\n\nThis link will expire in {VERIFICATION_TOKEN_EXPIRE_MINUTES} minutes.\n\nBest regards,\nDarkChat Team"
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_FROM
+    msg["To"] = email
+
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+        print(f"Verification email sent to {email}")
+    except Exception as e:
+        print(f"Failed to send verification email to {email}: {e}")
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-async def get_current_user(token: str = Depends(oauth2_scheme)) -> UserPublic:
+async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
-        user_id: str = payload.get("userId")
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
         if user_id is None:
             raise credentials_exception
-        user = await db.users.find_one({"_id": user_id})
-        if user is None:
-            raise credentials_exception
-        return UserPublic(**user)
-    except jwt.PyJWTError:
+    except InvalidTokenError:
         raise credentials_exception
+    user = await users_collection.find_one({"_id": ObjectId(user_id)})
+    if user is None:
+        raise credentials_exception
+    return UserInDB(**user)
 
-# Routes
-@app.get("/")
+# --- Models --- #
+class UserBase(BaseModel):
+    email: str
+    username: str
+
+class UserCreate(UserBase):
+    password: str
+
+class UserInDB(UserBase, MongoDBModel):
+    hashed_password: str
+    dc_id: str = Field(default_factory=lambda: ".".join(secrets.token_hex(2).upper() for _ in range(2)))
+    avatar_url: Optional[str] = None
+    is_online: bool = False
+    email_verified: bool = False
+    blocked_users: List[PyObjectId] = []
+    muted_users: List[PyObjectId] = []
+
+class UserPublic(UserBase, MongoDBModel):
+    dc_id: str
+    avatar_url: Optional[str] = None
+    is_online: bool
+    email_verified: bool
+
+    class Config:
+        json_encoders = {ObjectId: str}
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    user_id: Optional[str] = None
+
+class MessageBase(BaseModel):
+    content: str
+
+class MessageCreate(MessageBase):
+    conversation_id: Optional[str] = None
+    group_id: Optional[str] = None
+    sender_id: str
+    sender_name: str
+    sender_avatar: Optional[str] = None
+    is_edited: bool = False
+    is_deleted: bool = False
+
+class MessageInDB(MessageCreate, MongoDBModel):
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+class MessagePublic(MessageInDB):
+    class Config:
+        json_encoders = {ObjectId: str, datetime: lambda dt: dt.isoformat()}
+
+class ConversationBase(BaseModel):
+    participants: List[PyObjectId]
+
+class ConversationCreate(BaseModel):
+    other_user_id: str
+
+class ConversationInDB(ConversationBase, MongoDBModel):
+    last_message: Optional[MessagePublic] = None
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+class ConversationPublic(ConversationInDB):
+    other_user: UserPublic
+
+    class Config:
+        json_encoders = {ObjectId: str, datetime: lambda dt: dt.isoformat()}
+
+class GroupBase(BaseModel):
+    name: str
+    description: Optional[str] = None
+    members: List[PyObjectId]
+
+class GroupCreate(GroupBase):
+    pass
+
+class GroupInDB(GroupBase, MongoDBModel):
+    created_by: PyObjectId
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    last_message: Optional[MessagePublic] = None
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+class GroupPublic(GroupInDB):
+    class Config:
+        json_encoders = {ObjectId: str, datetime: lambda dt: dt.isoformat()}
+
+class CallOffer(BaseModel):
+    caller_id: str
+    caller_name: str
+    callee_id: str
+    sdp: str
+    type: str
+
+class CallAnswer(BaseModel):
+    answerer_id: str
+    answerer_name: str
+    caller_id: str
+    sdp: str
+    type: str
+
+class IceCandidate(BaseModel):
+    sender_id: str
+    receiver_id: str
+    candidate: str
+    sdp_mid: str
+    sdp_m_line_index: int
+
+# --- API Endpoints --- #
+@app.get("/", tags=["Root"])
 async def read_root():
     return {"message": "Dark Chat Server (Python) is running!"}
 
-@app.post("/api/register", response_model=UserPublic)
+@app.post("/api/register", response_model=Token, tags=["Auth"])
 async def register_user(user_data: UserCreate):
-    existing_user = await db.users.find_one({"$or": [{
-        "username": user_data.username
-    }, {
-        "email": user_data.email
-    }]})
+    existing_user = await users_collection.find_one({"email": user_data.email})
     if existing_user:
-        raise HTTPException(status_code=400, detail="Username or Email already exists")
-
-    hashed_password = hash_password(user_data.password)
-    user_dict = user_data.dict()
-    user_dict["hashed_password"] = hashed_password
-    del user_dict["password"]
-
-    result = await db.users.insert_one(user_dict)
-    new_user = await db.users.find_one({"_id": result.inserted_id})
-    return UserPublic(**new_user)
-
-@app.post("/api/login")
-async def login_for_access_token(form_data: UserLogin):
-    user = await db.users.find_one({"email": form_data.email})
-    if not user or not verify_password(form_data.password, user["hashed_password"]):
-        raise HTTPException(status_code=400, detail="Incorrect email or password")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
+    
+    hashed_password = get_password_hash(user_data.password)
+    user_in_db = UserInDB(email=user_data.email, username=user_data.username, hashed_password=hashed_password)
+    new_user = await users_collection.insert_one(user_in_dict := user_in_db.dict(by_alias=True))
+    
+    # Send verification email
+    verification_token = create_verification_token(user_data.email)
+    await send_verification_email(user_data.email, user_data.username, verification_token)
 
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={
-            "userId": str(user["_id"]),
-            "username": user["username"],
-            "email": user["email"]
-        },
+        data={"sub": str(new_user.inserted_id)},
         expires_delta=access_token_expires
     )
-    return {"access_token": access_token, "token_type": "bearer", "username": user["username"], "email": user["email"], "userId": str(user["_id"])}
+    user_public = UserPublic(**user_in_dict)
+    return {
+        "access_token": access_token, 
+        "token_type": "bearer",
+        "user": user_public.dict(by_alias=True)
+    }
 
-@app.get("/api/profile", response_model=UserPublic)
-async def get_profile(current_user: UserPublic = Depends(get_current_user)):
-    return current_user
-
-@app.get("/api/users/search", response_model=List[UserPublic])
-async def search_users(q: str, current_user: UserPublic = Depends(get_current_user)):
-    if not q:
-        raise HTTPException(status_code=400, detail="Search query is required")
+@app.get("/api/verify-email", tags=["Auth"])
+async def verify_email(token: str):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        token_type: str = payload.get("type")
+        if email is None or token_type != "email_verification":
+            raise credentials_exception
+    except InvalidTokenError:
+        raise credentials_exception
     
-    users_cursor = db.users.find({
+    user = await users_collection.find_one({"email": email})
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    
+    await users_collection.update_one({"email": email}, {"$set": {"email_verified": True}})
+    return {"message": "Email verified successfully! You can now log in."}
+
+@app.post("/api/resend-verification-email", status_code=status.HTTP_204_NO_CONTENT, tags=["Auth"])
+async def resend_verification_email(current_user: UserInDB = Depends(get_current_user)):
+    if current_user.email_verified:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already verified")
+    
+    verification_token = create_verification_token(current_user.email)
+    await send_verification_email(current_user.email, current_user.username, verification_token)
+    return
+
+@app.post("/api/login", response_model=Token, tags=["Auth"])
+async def login_for_access_token(user_data: UserCreate):
+    user = await users_collection.find_one({"email": user_data.email})
+    if not user or not verify_password(user_data.password, user["hashed_password"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": str(user["_id"])}
+    )
+    user_public = UserPublic(**user)
+    return {
+        "access_token": access_token, 
+        "token_type": "bearer",
+        "user": user_public.dict(by_alias=True)
+    }
+
+@app.get("/api/profile", response_model=UserPublic, tags=["Users"])
+async def read_users_me(current_user: UserInDB = Depends(get_current_user)):
+    return UserPublic(**current_user.dict())
+
+@app.get("/api/users/search", response_model=List[UserPublic], tags=["Users"])
+async def search_users(q: str, current_user: UserInDB = Depends(get_current_user)):
+    users = await users_collection.find({
         "$or": [
             {"username": {"$regex": q, "$options": "i"}},
-            {"email": {"$regex": q, "$options": "i"}}
+            {"email": {"$regex": q, "$options": "i"}},
+            {"dc_id": q} # Search by unique ID
         ],
-        "_id": {"$ne": current_user.id} # Exclude current user from search results
-    }).project({"username": 1, "email": 1})
-    
-    users = []
-    async for user in users_cursor:
-        users.append(UserPublic(**user))
-    return users
+        "_id": {"$ne": current_user.id} # Exclude current user
+    }).to_list(length=10)
+    return [UserPublic(**user) for user in users]
 
-@app.post("/api/conversations")
-async def create_conversation(otherUserId: str, current_user: UserPublic = Depends(get_current_user)):
-    userId = current_user.id
+@app.post("/api/conversations", response_model=Dict[str, str], tags=["Conversations"])
+async def create_conversation(conv_data: ConversationCreate, current_user: UserInDB = Depends(get_current_user)):
+    other_user_obj_id = ObjectId(conv_data.other_user_id)
+    if other_user_obj_id == current_user.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot create conversation with self")
 
-    existing_conversation = await db.conversations.find_one({
-        "participants": {"$all": [userId, otherUserId]}
+    # Check if conversation already exists
+    existing_conv = await conversations_collection.find_one({
+        "participants": {"$all": [current_user.id, other_user_obj_id]}
     })
+    if existing_conv:
+        return {"conversationId": str(existing_conv["_id"])}
 
-    if existing_conversation:
-        return {"conversationId": str(existing_conversation["_id"])}
+    conversation = ConversationInDB(participants=[current_user.id, other_user_obj_id])
+    new_conv = await conversations_collection.insert_one(conversation.dict(by_alias=True))
+    return {"conversationId": str(new_conv.inserted_id)}
 
-    conversation_dict = {"participants": [userId, otherUserId]}
-    result = await db.conversations.insert_one(conversation_dict)
-    return {"conversationId": str(result.inserted_id)}
-
-@app.get("/api/conversations", response_model=List[Conversation])
-async def get_conversations(current_user: UserPublic = Depends(get_current_user)):
-    userId = current_user.id
-    conversations_cursor = db.conversations.find({"participants": userId}).sort("updatedAt", -1)
+@app.get("/api/conversations", response_model=List[ConversationPublic], tags=["Conversations"])
+async def get_conversations(current_user: UserInDB = Depends(get_current_user)):
+    conversations = await conversations_collection.find({"participants": current_user.id}).sort("updated_at", -1).to_list(length=100)
     
-    conversations = []
-    async for conv in conversations_cursor:
-        other_user_id = next((p for p in conv["participants"] if p != userId), None)
-        other_user = await db.users.find_one({"_id": other_user_id})
-        
-        last_message = None
-        if conv.get("lastMessage"):
-            last_message_doc = await db.messages.find_one({"_id": conv["lastMessage"]})
-            if last_message_doc:
-                last_message = Message(**last_message_doc)
+    result = []
+    for conv_data in conversations:
+        other_user_id = next(p for p in conv_data["participants"] if p != current_user.id)
+        other_user = await users_collection.find_one({"_id": other_user_id})
+        if other_user:
+            conv_public = ConversationPublic(**conv_data, other_user=UserPublic(**other_user))
+            result.append(conv_public)
+    return result
 
-        conversations.append(Conversation(
-            id=str(conv["_id"]),
-            otherUser=UserPublic(**other_user),
-            lastMessage=last_message.id if last_message else None,
-            updatedAt=conv["updatedAt"]
-        ))
-    return conversations
+@app.get("/api/messages", response_model=List[MessagePublic], tags=["Messages"])
+async def get_messages(target_id: str, is_group: bool = False, offset: int = 0, limit: int = 50, current_user: UserInDB = Depends(get_current_user)):
+    target_obj_id = ObjectId(target_id)
+    
+    if is_group:
+        group = await groups_collection.find_one({"_id": target_obj_id, "members": current_user.id})
+        if not group:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found or not a member")
+        query = {"group_id": target_obj_id}
+    else:
+        conversation = await conversations_collection.find_one({"_id": target_obj_id, "participants": current_user.id})
+        if not conversation:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+        query = {"conversation_id": target_obj_id}
+    
+    messages = await messages_collection.find(query).sort("timestamp", -1).skip(offset).limit(limit).to_list(length=limit)
+    return [MessagePublic(**msg) for msg in messages]
 
-@app.get("/api/conversations/{convId}/messages", response_model=List[Message])
-async def get_messages(convId: str, offset: int = 0, limit: int = 50, current_user: UserPublic = Depends(get_current_user)):
-    messages_cursor = db.messages.find({"conversationId": convId, "isDeleted": False}).sort("timestamp", 1).skip(offset).limit(limit)
-    messages = []
-    async for msg in messages_cursor:
-        messages.append(Message(**msg))
-    return messages
+@app.post("/api/messages", response_model=MessagePublic, tags=["Messages"])
+async def send_message(message_data: MessageCreate, current_user: UserInDB = Depends(get_current_user)):
+    if not message_data.conversation_id and not message_data.group_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Either conversation_id or group_id must be provided")
 
-@app.post("/api/conversations/{convId}/messages", response_model=Message)
-async def send_message(convId: str, message_data: Dict[str, str], current_user: UserPublic = Depends(get_current_user)):
-    senderId = current_user.id
-    content = message_data.get("content")
+    if message_data.conversation_id:
+        target_id = ObjectId(message_data.conversation_id)
+        target_collection = conversations_collection
+        room_prefix = "conv_"
+    else:
+        target_id = ObjectId(message_data.group_id)
+        target_collection = groups_collection
+        room_prefix = "group_"
 
-    new_message_dict = {
-        "conversationId": convId,
-        "sender": senderId,
-        "content": content,
-        "timestamp": datetime.utcnow()
-    }
-    result = await db.messages.insert_one(new_message_dict)
-    new_message = await db.messages.find_one({"_id": result.inserted_id})
+    target = await target_collection.find_one({"_id": target_id})
+    if not target:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target not found")
+    
+    if current_user.id not in target["participants"] if message_data.conversation_id else current_user.id not in target["members"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to send message to this target")
 
-    await db.conversations.update_one(
-        {"_id": convId},
-        {"$set": {"lastMessage": str(new_message["_id"]), "updatedAt": datetime.utcnow()}}
+    message = MessageInDB(
+        conversation_id=message_data.conversation_id,
+        group_id=message_data.group_id,
+        sender_id=str(current_user.id),
+        sender_name=current_user.username,
+        content=message_data.content
     )
-
-    # Emit message via Socket.IO
-    await sio.emit(
-        "new_message",
-        {
-            "id": str(new_message["_id"]),
-            "conversationId": str(new_message["conversationId"]),
-            "senderId": str(new_message["sender"]),
-            "senderName": current_user.username,
-            "content": new_message["content"],
-            "timestamp": new_message["timestamp"].isoformat(),
-            "isEdited": new_message["isEdited"],
-            "isDeleted": new_message["isDeleted"],
-        },
-        room=convId
+    new_message = await messages_collection.insert_one(message.dict(by_alias=True))
+    
+    # Update last message and updated_at in target
+    await target_collection.update_one(
+        {"_id": target_id},
+        {"$set": {"last_message": message.dict(by_alias=True), "updated_at": datetime.utcnow()}}
     )
+    
+    # Emit message to participants via Socket.IO
+    participants = target["participants"] if message_data.conversation_id else target["members"]
+    for participant_id in participants:
+        if str(participant_id) != str(current_user.id):
+            await sio.emit("new_message", MessagePublic(**message.dict(by_alias=True)).dict(), room=room_prefix + str(participant_id))
 
-    return Message(**new_message)
+    return MessagePublic(**message.dict(by_alias=True))
 
-@app.put("/api/messages/{msgId}", response_model=Message)
-async def edit_message(msgId: str, message_data: Dict[str, str], current_user: UserPublic = Depends(get_current_user)):
-    userId = current_user.id
-    new_content = message_data.get("content")
-
-    message = await db.messages.find_one({"_id": msgId, "sender": userId})
+@app.put("/api/messages/{message_id}", response_model=MessagePublic, tags=["Messages"])
+async def edit_message(message_id: str, message_data: MessageBase, current_user: UserInDB = Depends(get_current_user)):
+    msg_obj_id = ObjectId(message_id)
+    message = await messages_collection.find_one({"_id": msg_obj_id, "sender_id": str(current_user.id)})
     if not message:
-        raise HTTPException(status_code=404, detail="Message not found or not authorized")
-
-    await db.messages.update_one(
-        {"_id": msgId},
-        {"$set": {"content": new_content, "isEdited": True, "timestamp": datetime.utcnow()}}
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found or not authorized")
+    
+    updated_message = await messages_collection.find_one_and_update(
+        {"_id": msg_obj_id},
+        {"$set": {"content": message_data.content, "is_edited": True, "timestamp": datetime.utcnow()}},
+        return_document=True
     )
-    updated_message = await db.messages.find_one({"_id": msgId})
+    if updated_message:
+        # Emit edit event to conversation participants
+        conversation = await conversations_collection.find_one({"_id": updated_message["conversation_id"]})
+        if conversation:
+            for participant_id in conversation["participants"]:
+                await sio.emit("message_edited", MessagePublic(**updated_message).dict(), room=str(participant_id))
+        return MessagePublic(**updated_message)
+    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to edit message")
 
-    await sio.emit(
-        "message_edited",
-        {
-            "id": str(updated_message["_id"]),
-            "conversationId": str(updated_message["conversationId"]),
-            "content": updated_message["content"],
-            "isEdited": updated_message["isEdited"],
-        },
-        room=str(updated_message["conversationId"])
+@app.post("/api/groups", response_model=GroupPublic, tags=["Groups"])
+async def create_group(group_data: GroupCreate, current_user: UserInDB = Depends(get_current_user)):
+    group_in_db = GroupInDB(**group_data.dict(), created_by=current_user.id, members=[current_user.id])
+    new_group = await database["groups"].insert_one(group_in_db.dict(by_alias=True))
+    created_group = await database["groups"].find_one({"_id": new_group.inserted_id})
+    return GroupPublic(**created_group)
+
+@app.get("/api/groups", response_model=List[GroupPublic], tags=["Groups"])
+async def get_user_groups(current_user: UserInDB = Depends(get_current_user)):
+    groups = await database["groups"].find({"members": current_user.id}).to_list(length=100)
+    return [GroupPublic(**group) for group in groups]
+
+@app.post("/api/groups/{group_id}/join", response_model=GroupPublic, tags=["Groups"])
+async def join_group(group_id: str, current_user: UserInDB = Depends(get_current_user)):
+    group_obj_id = ObjectId(group_id)
+    group = await database["groups"].find_one({"_id": group_obj_id})
+    if not group:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
+    
+    if current_user.id in group["members"]:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Already a member of this group")
+    
+    await database["groups"].update_one(
+        {"_id": group_obj_id},
+        {"$push": {"members": current_user.id}}
     )
+    updated_group = await database["groups"].find_one({"_id": group_obj_id})
+    return GroupPublic(**updated_group)
 
-    return Message(**updated_message)
+@app.post("/api/users/{user_id}/block", status_code=status.HTTP_204_NO_CONTENT, tags=["Users"])
+async def block_user(user_id: str, current_user: UserInDB = Depends(get_current_user)):
+    user_to_block_obj_id = ObjectId(user_id)
+    if user_to_block_obj_id == current_user.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot block self")
+    
+    await users_collection.update_one(
+        {"_id": current_user.id},
+        {"$addToSet": {"blocked_users": user_to_block_obj_id}}
+    )
+    return
 
-@app.delete("/api/messages/{msgId}")
-async def delete_message(msgId: str, current_user: UserPublic = Depends(get_current_user)):
-    userId = current_user.id
+@app.delete("/api/users/{user_id}/block", status_code=status.HTTP_204_NO_CONTENT, tags=["Users"])
+async def unblock_user(user_id: str, current_user: UserInDB = Depends(get_current_user)):
+    user_to_unblock_obj_id = ObjectId(user_id)
+    await users_collection.update_one(
+        {"_id": current_user.id},
+        {"$pull": {"blocked_users": user_to_unblock_obj_id}}
+    )
+    return
 
-    message = await db.messages.find_one({"_id": msgId})
+@app.delete("/api/messages/{message_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Messages"])
+async def delete_message(message_id: str, current_user: UserInDB = Depends(get_current_user)):
+    msg_obj_id = ObjectId(message_id)
+    message = await messages_collection.find_one({"_id": msg_obj_id, "sender_id": str(current_user.id)})
     if not message:
-        raise HTTPException(status_code=404, detail="Message not found")
-
-    conversation = await db.conversations.find_one({"_id": message["conversationId"]})
-    if not conversation or (str(message["sender"]) != userId and userId not in conversation["participants"]):
-        raise HTTPException(status_code=403, detail="Not authorized to delete this message")
-
-    await db.messages.update_one(
-        {"_id": msgId},
-        {"$set": {"isDeleted": True, "content": "This message was deleted.", "timestamp": datetime.utcnow()}}
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found or not authorized")
+    
+    await messages_collection.update_one(
+        {"_id": msg_obj_id},
+        {"$set": {"content": "This message was deleted.", "is_deleted": True, "timestamp": datetime.utcnow()}}
     )
-    deleted_message = await db.messages.find_one({"_id": msgId})
+    
+    # Emit delete event to conversation participants
+    conversation = await conversations_collection.find_one({"_id": message["conversation_id"]})
+    if conversation:
+        for participant_id in conversation["participants"]:
+            await sio.emit("message_deleted", {"message_id": message_id, "conversation_id": str(message["conversation_id"])}, room=str(participant_id))
 
-    await sio.emit(
-        "message_deleted",
-        {
-            "id": str(deleted_message["_id"]),
-            "conversationId": str(deleted_message["conversationId"]),
-            "isDeleted": deleted_message["isDeleted"],
-        },
-        room=str(deleted_message["conversationId"])
-    )
+    return
 
-    return {"message": "Message deleted successfully", "id": str(deleted_message["_id"]), "isDeleted": deleted_message["isDeleted"]}
-
-# Socket.IO Events
-@sio.event
+# --- Socket.IO Events --- #
+@sio.on("connect")
 async def connect(sid, environ, auth):
-    print("Socket connected:", sid)
     token = auth.get("token")
     if not token:
-        raise ConnectionRefusedError("Authentication token missing")
+        raise ConnectionRefusedError("Authentication token required")
+    
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
-        user_id = payload.get("userId")
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
         if user_id is None:
-            raise ConnectionRefusedError("Invalid authentication token")
-        sio.enter_room(sid, user_id) # User's personal room
-        sio.sid_to_user_id[sid] = user_id # Store user_id for later use
-        print(f"User {user_id} authenticated with socket {sid}")
-        await sio.emit("user_online", {"userId": user_id}, skip_sid=sid) # Notify others
-    except jwt.PyJWTError:
+            raise ConnectionRefusedError("Invalid token payload")
+    except InvalidTokenError:
         raise ConnectionRefusedError("Invalid authentication token")
+    
+    # Store user_id with sid
+    sio.enter_room(sid, user_id)
+    await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": {"is_online": True}})
+    print(f"User {user_id} connected with SID {sid}")
+    await sio.emit("user_online", {"userId": user_id}, skip_sid=sid)
 
-@sio.event
+    # Join all group rooms the user is a member of
+    user_groups = await groups_collection.find({"members": ObjectId(user_id)}).to_list(length=None)
+    for group in user_groups:
+        sio.enter_room(sid, "group_" + str(group["_id"]))
+
+@sio.on("disconnect")
 async def disconnect(sid):
-    print("Socket disconnected:", sid)
-    user_id = sio.sid_to_user_id.get(sid)
+    user_id = None
+    for room in sio.rooms(sid):
+        if room != sid: # The room is the user_id
+            user_id = room
+            break
+    
     if user_id:
-        await sio.emit("user_offline", {"userId": user_id}, skip_sid=sid) # Notify others
-        del sio.sid_to_user_id[sid]
+        await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": {"is_online": False}})
+        print(f"User {user_id} disconnected from SID {sid}")
+        await sio.emit("user_offline", {"userId": user_id}, skip_sid=sid)
 
-@sio.event
-async def join_conversation(sid, data):
-    conversation_id = data.get("conversation_id")
-    if conversation_id:
-        sio.enter_room(sid, conversation_id)
-        print(f"User {sio.sid_to_user_id.get(sid)} joined conversation: {conversation_id}")
+        # Leave all group rooms the user was a member of
+        user_groups = await groups_collection.find({"members": ObjectId(user_id)}).to_list(length=None)
+        for group in user_groups:
+            sio.leave_room(sid, "group_" + str(group["_id"]))
 
-@sio.event
-async def leave_conversation(sid, data):
-    conversation_id = data.get("conversation_id")
-    if conversation_id:
-        sio.leave_room(sid, conversation_id)
-        print(f"User {sio.sid_to_user_id.get(sid)} left conversation: {conversation_id}")
+@sio.on("call_offer")
+async def handle_call_offer(sid, data):
+    offer = CallOffer(**data)
+    await sio.emit("call_offer", offer.dict(), room=offer.callee_id)
 
-@sio.event
+@sio.on("call_answer")
+async def handle_call_answer(sid, data):
+    answer = CallAnswer(**data)
+    await sio.emit("call_answer", answer.dict(), room=answer.caller_id)
+
+@sio.on("ice_candidate")
+async def handle_ice_candidate(sid, data):
+    candidate = IceCandidate(**data)
+    await sio.emit("ice_candidate", candidate.dict(), room=candidate.receiver_id)
+
+@sio.on("call_end")
+async def handle_call_end(sid, data):
+    callee_id = data.get("callee_id")
+    caller_id = data.get("caller_id")
+    if callee_id:
+        await sio.emit("call_end", {"caller_id": caller_id}, room=callee_id)
+    if caller_id:
+        await sio.emit("call_end", {"callee_id": callee_id}, room=caller_id)
+
+@sio.on("typing")
 async def typing(sid, data):
-    conversation_id = data.get("conversation_id")
-    is_typing = data.get("is_typing")
-    user_id = sio.sid_to_user_id.get(sid)
-    if conversation_id and user_id:
-        await sio.emit("typing_status", {"conversationId": conversation_id, "userId": user_id, "isTyping": is_typing}, room=conversation_id, skip_sid=sid)
+    user_id = data.get("userId")
+    conversation_id = data.get("conversationId")
+    if user_id and conversation_id:
+        # Emit typing event to other participants in the conversation
+        conversation = await conversations_collection.find_one({"_id": ObjectId(conversation_id)})
+        if conversation:
+            for participant_id in conversation["participants"]:
+                if str(participant_id) != user_id:
+                    await sio.emit("typing", {"userId": user_id, "conversationId": conversation_id}, room=str(participant_id))
 
-# Store mapping from sid to user_id for socket events
-sio.sid_to_user_id = {}
+# --- Keep-alive for Render --- #
+async def keep_alive():
+    while True:
+        await asyncio.sleep(600)  # Ping every 10 minutes
+        print("Pinging self to stay alive...")
+        # You can make a simple HTTP GET request to your own / endpoint here
+        # For Render, just having activity might be enough, but a self-ping is safer.
 
-# Run the app with uvicorn (for local development)
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.on_event("startup")
+async def startup_event():
+    print("Starting Dark Chat Server...")
+    # Start the keep-alive task in the background
+    asyncio.create_task(keep_alive())
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    print("Shutting down Dark Chat Server...")
+    client.close()
+
