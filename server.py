@@ -12,8 +12,7 @@ from pydantic import BaseModel, Field
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from passlib.context import CryptContext
-import jwt
-from jwt.exceptions import InvalidTokenError
+from jose import JWTError, jwt
 import socketio
 from dotenv import load_dotenv
 import smtplib
@@ -149,7 +148,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         user_id: str = payload.get("sub")
         if user_id is None:
             raise credentials_exception
-    except InvalidTokenError:
+    except JWTError:
         raise credentials_exception
     user = await users_collection.find_one({"_id": ObjectId(user_id)})
     if user is None:
@@ -307,7 +306,7 @@ async def verify_email(token: str):
         token_type: str = payload.get("type")
         if email is None or token_type != "email_verification":
             raise credentials_exception
-    except InvalidTokenError:
+    except JWTError:
         raise credentials_exception
     
     user = await users_collection.find_one({"email": email})
@@ -400,12 +399,13 @@ async def get_messages(target_id: str, is_group: bool = False, offset: int = 0, 
         group = await groups_collection.find_one({"_id": target_obj_id, "members": current_user.id})
         if not group:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found or not a member")
-        query = {"group_id": target_obj_id}
+        query = {"group_id": target_id}
     else:
-        conversation = await conversations_collection.find_one({"_id": target_obj_id, "participants": current_user.id})
-        if not conversation:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
-        query = {"conversation_id": target_obj_id}
+        # Check if conversation exists and user is participant
+        conv = await conversations_collection.find_one({"_id": target_obj_id, "participants": current_user.id})
+        if not conv:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found or not a participant")
+        query = {"conversation_id": target_id}
     
     messages = await messages_collection.find(query).sort("timestamp", -1).skip(offset).limit(limit).to_list(length=limit)
     return [MessagePublic(**msg) for msg in messages]
@@ -416,178 +416,131 @@ async def send_message(message_data: MessageCreate, current_user: UserInDB = Dep
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Either conversation_id or group_id must be provided")
 
     if message_data.conversation_id:
-        target_id = ObjectId(message_data.conversation_id)
-        target_collection = conversations_collection
-        room_prefix = "conv_"
+        target_id = message_data.conversation_id
+        is_group = False
+        # Verify conversation
+        conv = await conversations_collection.find_one({"_id": ObjectId(target_id), "participants": current_user.id})
+        if not conv:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a participant in this conversation")
     else:
-        target_id = ObjectId(message_data.group_id)
-        target_collection = groups_collection
-        room_prefix = "group_"
+        target_id = message_data.group_id
+        is_group = True
+        # Verify group
+        group = await groups_collection.find_one({"_id": ObjectId(target_id), "members": current_user.id})
+        if not group:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a member of this group")
 
-    target = await target_collection.find_one({"_id": target_id})
-    if not target:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target not found")
-    
-    if current_user.id not in target["participants"] if message_data.conversation_id else current_user.id not in target["members"]:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to send message to this target")
+    message = MessageInDB(**message_data.dict(), sender_id=str(current_user.id), sender_name=current_user.username)
+    new_msg = await messages_collection.insert_one(message.dict(by_alias=True))
+    msg_public = MessagePublic(**message.dict(), _id=new_msg.inserted_id)
 
-    message = MessageInDB(
-        conversation_id=message_data.conversation_id,
-        group_id=message_data.group_id,
-        sender_id=str(current_user.id),
-        sender_name=current_user.username,
-        content=message_data.content
-    )
-    new_message = await messages_collection.insert_one(message.dict(by_alias=True))
-    
-    # Update last message and updated_at in target
-    await target_collection.update_one(
-        {"_id": target_id},
-        {"$set": {"last_message": message.dict(by_alias=True), "updated_at": datetime.utcnow()}}
-    )
-    
-    # Emit message to participants via Socket.IO
-    participants = target["participants"] if message_data.conversation_id else target["members"]
-    for participant_id in participants:
-        if str(participant_id) != str(current_user.id):
-            await sio.emit("new_message", MessagePublic(**message.dict(by_alias=True)).dict(), room=room_prefix + str(participant_id))
+    # Update conversation/group timestamp
+    if is_group:
+        await groups_collection.update_one({"_id": ObjectId(target_id)}, {"$set": {"updated_at": datetime.utcnow(), "last_message": msg_public.dict()}})
+        room = "group_" + target_id
+    else:
+        await conversations_collection.update_one({"_id": ObjectId(target_id)}, {"$set": {"updated_at": datetime.utcnow(), "last_message": msg_public.dict()}})
+        other_user_id = next(str(p) for p in conv["participants"] if str(p) != str(current_user.id))
+        room = other_user_id
 
-    return MessagePublic(**message.dict(by_alias=True))
+    # Emit via Socket.IO
+    await sio.emit("new_message", msg_public.dict(), room=room)
+    return msg_public
 
 @app.put("/api/messages/{message_id}", response_model=MessagePublic, tags=["Messages"])
-async def edit_message(message_id: str, message_data: MessageBase, current_user: UserInDB = Depends(get_current_user)):
-    msg_obj_id = ObjectId(message_id)
-    message = await messages_collection.find_one({"_id": msg_obj_id, "sender_id": str(current_user.id)})
-    if not message:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found or not authorized")
+async def edit_message(message_id: str, content: str, current_user: UserInDB = Depends(get_current_user)):
+    msg = await messages_collection.find_one({"_id": ObjectId(message_id), "sender_id": str(current_user.id)})
+    if not msg:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found or not the sender")
     
-    updated_message = await messages_collection.find_one_and_update(
-        {"_id": msg_obj_id},
-        {"$set": {"content": message_data.content, "is_edited": True, "timestamp": datetime.utcnow()}},
-        return_document=True
-    )
-    if updated_message:
-        # Emit edit event to conversation participants
-        conversation = await conversations_collection.find_one({"_id": updated_message["conversation_id"]})
-        if conversation:
-            for participant_id in conversation["participants"]:
-                await sio.emit("message_edited", MessagePublic(**updated_message).dict(), room=str(participant_id))
-        return MessagePublic(**updated_message)
-    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to edit message")
+    await messages_collection.update_one({"_id": ObjectId(message_id)}, {"$set": {"content": content, "is_edited": True}})
+    updated_msg = await messages_collection.find_one({"_id": ObjectId(message_id)})
+    msg_public = MessagePublic(**updated_msg)
+    
+    # Notify via Socket.IO
+    room = msg.get("group_id") if msg.get("group_id") else msg.get("conversation_id")
+    await sio.emit("message_edited", msg_public.dict(), room=room)
+    return msg_public
+
+@app.delete("/api/messages/{message_id}", tags=["Messages"])
+async def delete_message(message_id: str, current_user: UserInDB = Depends(get_current_user)):
+    msg = await messages_collection.find_one({"_id": ObjectId(message_id), "sender_id": str(current_user.id)})
+    if not msg:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found or not the sender")
+    
+    await messages_collection.delete_one({"_id": ObjectId(message_id)})
+    
+    # Notify via Socket.IO
+    room = msg.get("group_id") if msg.get("group_id") else msg.get("conversation_id")
+    await sio.emit("message_deleted", {"message_id": message_id, "room": room}, room=room)
+    return {"message": "Message deleted"}
 
 @app.post("/api/groups", response_model=GroupPublic, tags=["Groups"])
 async def create_group(group_data: GroupCreate, current_user: UserInDB = Depends(get_current_user)):
-    group_in_db = GroupInDB(**group_data.dict(), created_by=current_user.id, members=[current_user.id])
-    new_group = await database["groups"].insert_one(group_in_db.dict(by_alias=True))
-    created_group = await database["groups"].find_one({"_id": new_group.inserted_id})
-    return GroupPublic(**created_group)
+    group = GroupInDB(
+        **group_data.dict(), 
+        members=[current_user.id], 
+        created_by=current_user.id
+    )
+    new_group = await groups_collection.insert_one(group.dict(by_alias=True))
+    return GroupPublic(**group.dict(), _id=new_group.inserted_id)
 
 @app.get("/api/groups", response_model=List[GroupPublic], tags=["Groups"])
-async def get_user_groups(current_user: UserInDB = Depends(get_current_user)):
-    groups = await database["groups"].find({"members": current_user.id}).to_list(length=100)
-    return [GroupPublic(**group) for group in groups]
+async def get_groups(current_user: UserInDB = Depends(get_current_user)):
+    groups = await groups_collection.find({"members": current_user.id}).sort("updated_at", -1).to_list(length=100)
+    return [GroupPublic(**g) for g in groups]
 
-@app.post("/api/groups/{group_id}/join", response_model=GroupPublic, tags=["Groups"])
+@app.post("/api/groups/{group_id}/join", tags=["Groups"])
 async def join_group(group_id: str, current_user: UserInDB = Depends(get_current_user)):
-    group_obj_id = ObjectId(group_id)
-    group = await database["groups"].find_one({"_id": group_obj_id})
+    group = await groups_collection.find_one({"_id": ObjectId(group_id)})
     if not group:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
     
     if current_user.id in group["members"]:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Already a member of this group")
+        return {"message": "Already a member"}
     
-    await database["groups"].update_one(
-        {"_id": group_obj_id},
-        {"$push": {"members": current_user.id}}
-    )
-    updated_group = await database["groups"].find_one({"_id": group_obj_id})
-    return GroupPublic(**updated_group)
+    await groups_collection.update_one({"_id": ObjectId(group_id)}, {"$push": {"members": current_user.id}})
+    return {"message": "Joined group successfully"}
 
-@app.post("/api/users/{user_id}/block", status_code=status.HTTP_204_NO_CONTENT, tags=["Users"])
+@app.post("/api/users/{user_id}/block", tags=["Privacy"])
 async def block_user(user_id: str, current_user: UserInDB = Depends(get_current_user)):
-    user_to_block_obj_id = ObjectId(user_id)
-    if user_to_block_obj_id == current_user.id:
+    target_obj_id = ObjectId(user_id)
+    if target_obj_id == current_user.id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot block self")
     
-    await users_collection.update_one(
-        {"_id": current_user.id},
-        {"$addToSet": {"blocked_users": user_to_block_obj_id}}
-    )
-    return
+    await users_collection.update_one({"_id": current_user.id}, {"$addToSet": {"blocked_users": target_obj_id}})
+    return {"message": "User blocked"}
 
-@app.delete("/api/users/{user_id}/block", status_code=status.HTTP_204_NO_CONTENT, tags=["Users"])
+@app.delete("/api/users/{user_id}/block", tags=["Privacy"])
 async def unblock_user(user_id: str, current_user: UserInDB = Depends(get_current_user)):
-    user_to_unblock_obj_id = ObjectId(user_id)
-    await users_collection.update_one(
-        {"_id": current_user.id},
-        {"$pull": {"blocked_users": user_to_unblock_obj_id}}
-    )
-    return
-
-@app.delete("/api/messages/{message_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Messages"])
-async def delete_message(message_id: str, current_user: UserInDB = Depends(get_current_user)):
-    msg_obj_id = ObjectId(message_id)
-    message = await messages_collection.find_one({"_id": msg_obj_id, "sender_id": str(current_user.id)})
-    if not message:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found or not authorized")
-    
-    await messages_collection.update_one(
-        {"_id": msg_obj_id},
-        {"$set": {"content": "This message was deleted.", "is_deleted": True, "timestamp": datetime.utcnow()}}
-    )
-    
-    # Emit delete event to conversation participants
-    conversation = await conversations_collection.find_one({"_id": message["conversation_id"]})
-    if conversation:
-        for participant_id in conversation["participants"]:
-            await sio.emit("message_deleted", {"message_id": message_id, "conversation_id": str(message["conversation_id"])}, room=str(participant_id))
-
-    return
+    await users_collection.update_one({"_id": current_user.id}, {"$pull": {"blocked_users": ObjectId(user_id)}})
+    return {"message": "User unblocked"}
 
 # --- Socket.IO Events --- #
 @sio.on("connect")
-async def connect(sid, environ, auth):
-    token = auth.get("token")
-    if not token:
-        raise ConnectionRefusedError("Authentication token required")
-    
-    try:
-        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("sub")
-        if user_id is None:
-            raise ConnectionRefusedError("Invalid token payload")
-    except InvalidTokenError:
-        raise ConnectionRefusedError("Invalid authentication token")
-    
-    # Store user_id with sid
-    sio.enter_room(sid, user_id)
-    await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": {"is_online": True}})
-    print(f"User {user_id} connected with SID {sid}")
-    await sio.emit("user_online", {"userId": user_id}, skip_sid=sid)
+async def connect(sid, environ):
+    # In a real app, verify JWT from headers/query
+    print(f"Client connected: {sid}")
 
-    # Join all group rooms the user is a member of
-    user_groups = await groups_collection.find({"members": ObjectId(user_id)}).to_list(length=None)
-    for group in user_groups:
-        sio.enter_room(sid, "group_" + str(group["_id"]))
+@sio.on("join")
+async def join(sid, data):
+    user_id = data.get("userId")
+    if user_id:
+        sio.enter_room(sid, user_id)
+        # Also join group rooms
+        user_groups = await groups_collection.find({"members": ObjectId(user_id)}).to_list(length=None)
+        for group in user_groups:
+            sio.enter_room(sid, "group_" + str(group["_id"]))
+        print(f"User {user_id} joined room")
 
 @sio.on("disconnect")
 async def disconnect(sid):
-    user_id = None
-    for room in sio.rooms(sid):
-        if room != sid: # The room is the user_id
-            user_id = room
-            break
-    
-    if user_id:
-        await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": {"is_online": False}})
-        print(f"User {user_id} disconnected from SID {sid}")
-        await sio.emit("user_offline", {"userId": user_id}, skip_sid=sid)
-
-        # Leave all group rooms the user was a member of
-        user_groups = await groups_collection.find({"members": ObjectId(user_id)}).to_list(length=None)
-        for group in user_groups:
-            sio.leave_room(sid, "group_" + str(group["_id"]))
+    print(f"Client disconnected: {sid}")
+    # Leave all rooms
+    rooms = sio.rooms(sid)
+    for room in rooms:
+        if room != sid:
+            sio.leave_room(sid, room)
 
 @sio.on("call_offer")
 async def handle_call_offer(sid, data):
@@ -616,31 +569,19 @@ async def handle_call_end(sid, data):
 @sio.on("typing")
 async def typing(sid, data):
     user_id = data.get("userId")
-    conversation_id = data.get("conversationId")
-    if user_id and conversation_id:
-        # Emit typing event to other participants in the conversation
-        conversation = await conversations_collection.find_one({"_id": ObjectId(conversation_id)})
-        if conversation:
-            for participant_id in conversation["participants"]:
-                if str(participant_id) != user_id:
-                    await sio.emit("typing", {"userId": user_id, "conversationId": conversation_id}, room=str(participant_id))
+    target_id = data.get("targetId")
+    is_group = data.get("isGroup", False)
+    if user_id and target_id:
+        room = "group_" + target_id if is_group else target_id
+        await sio.emit("typing", {"userId": user_id, "isTyping": True}, room=room, skip_sid=sid)
 
-# --- Keep-alive for Render --- #
-async def keep_alive():
+# --- Background Task: Render Pulse --- #
+async def render_pulse():
+    """Keep the server alive on Render free tier."""
     while True:
-        await asyncio.sleep(600)  # Ping every 10 minutes
-        print("Pinging self to stay alive...")
-        # You can make a simple HTTP GET request to your own / endpoint here
-        # For Render, just having activity might be enough, but a self-ping is safer.
+        await asyncio.sleep(600) # Every 10 minutes
+        print("Pulse: Keeping server alive...")
 
 @app.on_event("startup")
 async def startup_event():
-    print("Starting Dark Chat Server...")
-    # Start the keep-alive task in the background
-    asyncio.create_task(keep_alive())
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    print("Shutting down Dark Chat Server...")
-    client.close()
-
+    asyncio.create_task(render_pulse())
