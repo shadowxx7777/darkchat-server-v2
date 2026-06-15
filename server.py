@@ -8,7 +8,7 @@ from typing import List, Optional, Dict, Any, Annotated
 from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, ConfigDict, GetJsonSchemaHandler
+from pydantic import BaseModel, Field, ConfigDict, GetJsonSchemaHandler, BeforeValidator
 from pydantic.json_schema import JsonSchemaValue
 from pydantic_core import core_schema
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -56,36 +56,14 @@ sio = socketio.AsyncServer(cors_allowed_origins="*", async_mode="asgi")
 app.mount("/ws", socketio.ASGIApp(sio))
 
 # --- Database Setup --- #
-class PyObjectId(ObjectId):
-    @classmethod
-    def __get_pydantic_core_schema__(
-        cls, _source_type: Any, _handler: GetJsonSchemaHandler
-    ) -> core_schema.CoreSchema:
-        return core_schema.json_or_python_schema(
-            json_schema=core_schema.str_schema(),
-            python_schema=core_schema.union_schema([
-                core_schema.is_instance_schema(ObjectId),
-                core_schema.chain_schema([
-                    core_schema.str_schema(),
-                    core_schema.no_info_plain_validator_function(cls.validate),
-                ]),
-            ]),
-            serialization=core_schema.plain_serializer_function_wrap_handler(
-                lambda v, handler: str(v)
-            ),
-        )
-
-    @classmethod
-    def validate(cls, v):
-        if not ObjectId.is_valid(v):
-            raise ValueError("Invalid ObjectId")
+def validate_object_id(v: Any) -> ObjectId:
+    if isinstance(v, ObjectId):
+        return v
+    if ObjectId.is_valid(v):
         return ObjectId(v)
+    raise ValueError("Invalid ObjectId")
 
-    @classmethod
-    def __get_pydantic_json_schema__(
-        cls, _core_schema: core_schema.CoreSchema, handler: GetJsonSchemaHandler
-    ) -> JsonSchemaValue:
-        return handler(core_schema.str_schema())
+PyObjectId = Annotated[ObjectId, BeforeValidator(validate_object_id)]
 
 class MongoDBModel(BaseModel):
     id: Optional[PyObjectId] = Field(default=None, alias="_id")
