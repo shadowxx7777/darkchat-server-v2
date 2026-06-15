@@ -3,12 +3,14 @@ import os
 import asyncio
 import secrets
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Annotated
 
 from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict, GetJsonSchemaHandler
+from pydantic.json_schema import JsonSchemaValue
+from pydantic_core import core_schema
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from passlib.context import CryptContext
@@ -56,8 +58,22 @@ app.mount("/ws", socketio.ASGIApp(sio))
 # --- Database Setup --- #
 class PyObjectId(ObjectId):
     @classmethod
-    def __get_validators__(cls):
-        yield cls.validate
+    def __get_pydantic_core_schema__(
+        cls, _source_type: Any, _handler: GetJsonSchemaHandler
+    ) -> core_schema.CoreSchema:
+        return core_schema.json_or_python_schema(
+            json_schema=core_schema.str_schema(),
+            python_schema=core_schema.union_schema([
+                core_schema.is_instance_schema(ObjectId),
+                core_schema.chain_schema([
+                    core_schema.str_schema(),
+                    core_schema.no_info_plain_validator_function(cls.validate),
+                ]),
+            ]),
+            serialization=core_schema.plain_serializer_function_wrap_handler(
+                lambda v, handler: str(v)
+            ),
+        )
 
     @classmethod
     def validate(cls, v):
@@ -66,16 +82,19 @@ class PyObjectId(ObjectId):
         return ObjectId(v)
 
     @classmethod
-    def __modify_schema__(cls, field_schema: Dict[str, Any]):
-        field_schema.update(type="string")
+    def __get_pydantic_json_schema__(
+        cls, _core_schema: core_schema.CoreSchema, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        return handler(core_schema.str_schema())
 
 class MongoDBModel(BaseModel):
-    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
-
-    class Config:
-        allow_population_by_field_name = True
-        arbitrary_types_allowed = True
-        json_encoders = {ObjectId: str}
+    id: Optional[PyObjectId] = Field(default=None, alias="_id")
+    
+    model_config = ConfigDict(
+        populate_by_name=True,
+        arbitrary_types_allowed=True,
+        json_encoders={ObjectId: str}
+    )
 
 client = AsyncIOMotorClient(MONGO_DETAILS)
 database = client.darkchat
@@ -178,9 +197,6 @@ class UserPublic(UserBase, MongoDBModel):
     is_online: bool
     email_verified: bool
 
-    class Config:
-        json_encoders = {ObjectId: str}
-
 class Token(BaseModel):
     access_token: str
     token_type: str
@@ -204,8 +220,9 @@ class MessageInDB(MessageCreate, MongoDBModel):
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 class MessagePublic(MessageInDB):
-    class Config:
-        json_encoders = {ObjectId: str, datetime: lambda dt: dt.isoformat()}
+    model_config = ConfigDict(
+        json_encoders={ObjectId: str, datetime: lambda dt: dt.isoformat()}
+    )
 
 class ConversationBase(BaseModel):
     participants: List[PyObjectId]
@@ -219,9 +236,6 @@ class ConversationInDB(ConversationBase, MongoDBModel):
 
 class ConversationPublic(ConversationInDB):
     other_user: UserPublic
-
-    class Config:
-        json_encoders = {ObjectId: str, datetime: lambda dt: dt.isoformat()}
 
 class GroupBase(BaseModel):
     name: str
@@ -238,8 +252,7 @@ class GroupInDB(GroupBase, MongoDBModel):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 class GroupPublic(GroupInDB):
-    class Config:
-        json_encoders = {ObjectId: str, datetime: lambda dt: dt.isoformat()}
+    pass
 
 class CallOffer(BaseModel):
     caller_id: str
@@ -275,7 +288,8 @@ async def register_user(user_data: UserCreate):
     
     hashed_password = get_password_hash(user_data.password)
     user_in_db = UserInDB(email=user_data.email, username=user_data.username, hashed_password=hashed_password)
-    new_user = await users_collection.insert_one(user_in_dict := user_in_db.dict(by_alias=True))
+    user_in_dict = user_in_db.model_dump(by_alias=True)
+    new_user = await users_collection.insert_one(user_in_dict)
     
     # Send verification email
     verification_token = create_verification_token(user_data.email)
@@ -290,7 +304,7 @@ async def register_user(user_data: UserCreate):
     return {
         "access_token": access_token, 
         "token_type": "bearer",
-        "user": user_public.dict(by_alias=True)
+        "user": user_public.model_dump(by_alias=True)
     }
 
 @app.get("/api/verify-email", tags=["Auth"])
@@ -342,12 +356,12 @@ async def login_for_access_token(user_data: UserCreate):
     return {
         "access_token": access_token, 
         "token_type": "bearer",
-        "user": user_public.dict(by_alias=True)
+        "user": user_public.model_dump(by_alias=True)
     }
 
 @app.get("/api/profile", response_model=UserPublic, tags=["Users"])
 async def read_users_me(current_user: UserInDB = Depends(get_current_user)):
-    return UserPublic(**current_user.dict())
+    return UserPublic(**current_user.model_dump())
 
 @app.get("/api/users/search", response_model=List[UserPublic], tags=["Users"])
 async def search_users(q: str, current_user: UserInDB = Depends(get_current_user)):
@@ -375,7 +389,7 @@ async def create_conversation(conv_data: ConversationCreate, current_user: UserI
         return {"conversationId": str(existing_conv["_id"])}
 
     conversation = ConversationInDB(participants=[current_user.id, other_user_obj_id])
-    new_conv = await conversations_collection.insert_one(conversation.dict(by_alias=True))
+    new_conv = await conversations_collection.insert_one(conversation.model_dump(by_alias=True))
     return {"conversationId": str(new_conv.inserted_id)}
 
 @app.get("/api/conversations", response_model=List[ConversationPublic], tags=["Conversations"])
@@ -430,21 +444,21 @@ async def send_message(message_data: MessageCreate, current_user: UserInDB = Dep
         if not group:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a member of this group")
 
-    message = MessageInDB(**message_data.dict(), sender_id=str(current_user.id), sender_name=current_user.username)
-    new_msg = await messages_collection.insert_one(message.dict(by_alias=True))
-    msg_public = MessagePublic(**message.dict(), _id=new_msg.inserted_id)
+    message = MessageInDB(**message_data.model_dump(), sender_id=str(current_user.id), sender_name=current_user.username)
+    new_msg = await messages_collection.insert_one(message.model_dump(by_alias=True))
+    msg_public = MessagePublic(**message.model_dump(), _id=new_msg.inserted_id)
 
     # Update conversation/group timestamp
     if is_group:
-        await groups_collection.update_one({"_id": ObjectId(target_id)}, {"$set": {"updated_at": datetime.utcnow(), "last_message": msg_public.dict()}})
+        await groups_collection.update_one({"_id": ObjectId(target_id)}, {"$set": {"updated_at": datetime.utcnow(), "last_message": msg_public.model_dump(mode='json')}})
         room = "group_" + target_id
     else:
-        await conversations_collection.update_one({"_id": ObjectId(target_id)}, {"$set": {"updated_at": datetime.utcnow(), "last_message": msg_public.dict()}})
+        await conversations_collection.update_one({"_id": ObjectId(target_id)}, {"$set": {"updated_at": datetime.utcnow(), "last_message": msg_public.model_dump(mode='json')}})
         other_user_id = next(str(p) for p in conv["participants"] if str(p) != str(current_user.id))
         room = other_user_id
 
     # Emit via Socket.IO
-    await sio.emit("new_message", msg_public.dict(), room=room)
+    await sio.emit("new_message", msg_public.model_dump(mode='json'), room=room)
     return msg_public
 
 @app.put("/api/messages/{message_id}", response_model=MessagePublic, tags=["Messages"])
@@ -459,7 +473,7 @@ async def edit_message(message_id: str, content: str, current_user: UserInDB = D
     
     # Notify via Socket.IO
     room = msg.get("group_id") if msg.get("group_id") else msg.get("conversation_id")
-    await sio.emit("message_edited", msg_public.dict(), room=room)
+    await sio.emit("message_edited", msg_public.model_dump(mode='json'), room=room)
     return msg_public
 
 @app.delete("/api/messages/{message_id}", tags=["Messages"])
@@ -478,12 +492,12 @@ async def delete_message(message_id: str, current_user: UserInDB = Depends(get_c
 @app.post("/api/groups", response_model=GroupPublic, tags=["Groups"])
 async def create_group(group_data: GroupCreate, current_user: UserInDB = Depends(get_current_user)):
     group = GroupInDB(
-        **group_data.dict(), 
+        **group_data.model_dump(), 
         members=[current_user.id], 
         created_by=current_user.id
     )
-    new_group = await groups_collection.insert_one(group.dict(by_alias=True))
-    return GroupPublic(**group.dict(), _id=new_group.inserted_id)
+    new_group = await groups_collection.insert_one(group.model_dump(by_alias=True))
+    return GroupPublic(**group.model_dump(), _id=new_group.inserted_id)
 
 @app.get("/api/groups", response_model=List[GroupPublic], tags=["Groups"])
 async def get_groups(current_user: UserInDB = Depends(get_current_user)):
@@ -545,17 +559,17 @@ async def disconnect(sid):
 @sio.on("call_offer")
 async def handle_call_offer(sid, data):
     offer = CallOffer(**data)
-    await sio.emit("call_offer", offer.dict(), room=offer.callee_id)
+    await sio.emit("call_offer", offer.model_dump(), room=offer.callee_id)
 
 @sio.on("call_answer")
 async def handle_call_answer(sid, data):
     answer = CallAnswer(**data)
-    await sio.emit("call_answer", answer.dict(), room=answer.caller_id)
+    await sio.emit("call_answer", answer.model_dump(), room=answer.caller_id)
 
 @sio.on("ice_candidate")
 async def handle_ice_candidate(sid, data):
     candidate = IceCandidate(**data)
-    await sio.emit("ice_candidate", candidate.dict(), room=candidate.receiver_id)
+    await sio.emit("ice_candidate", candidate.model_dump(), room=candidate.receiver_id)
 
 @sio.on("call_end")
 async def handle_call_end(sid, data):
